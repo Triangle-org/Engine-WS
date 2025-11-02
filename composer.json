@@ -1,6 +1,6 @@
 {
   "name": "triangle/engine-ws",
-  "description": "Triangle WebSocket triangle/websocket",
+  "description": "WebSocket layer for Triangle Framework based on localzet Server",
   "type": "library",
   "keywords": [
     "localzet",
@@ -18,7 +18,7 @@
   ],
   "support": {
     "email": "support@localzet.com",
-    "source": "https://github.com/Triangle-org/Http"
+    "source": "https://github.com/Triangle-org/Engine-WS"
   },
   "autoload": {
     "psr-4": {
@@ -27,10 +27,10 @@
     }
   },
   "require": {
-    "php": "^8.0",
-    "triangle/engine": ">=8",
-    "triangle/router": "^1.1",
-    "triangle/middleware": "^1.1"
+    "php": "^8.1",
+    "triangle/engine": "^8.1",
+    "triangle/router": "^2.0",
+    "triangle/middleware": "^2.0"
   },
   "conflict": {
     "triangle/engine-http": "*"
