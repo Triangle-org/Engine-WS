@@ -87,6 +87,11 @@ class App extends ServerAbstract
     protected static array $connectionsMap = [];
 
     /**
+     * @var array<string, string> Маппинг object_id соединения к UUID
+     */
+    protected static array $connectionUuids = [];
+
+    /**
      * Реакция на HTTP-рукопожатие перед WS-соединением
      * @param TcpConnection $connection
      * @param Http\Request $request
@@ -97,7 +102,8 @@ class App extends ServerAbstract
     {
         try {
             // Генерация уникального идентификатора для соединения
-            $connection->uuid = generateId();
+            $uuid = generateId();
+            static::$connectionUuids[spl_object_id($connection)] = $uuid;
             $path = $request->path();
 
             // Установка контекста соединения
@@ -192,10 +198,13 @@ class App extends ServerAbstract
             }
 
             // Обновление карты соединений
-            if (!isset(static::$connectionsMap[$path])) {
-                static::$connectionsMap[$path] = [$connection->uuid => $connection];
-            } else {
-                static::$connectionsMap[$path][$connection->uuid] = $connection;
+            $uuid = static::$connectionUuids[spl_object_id($connection)] ?? null;
+            if ($uuid) {
+                if (!isset(static::$connectionsMap[$path])) {
+                    static::$connectionsMap[$path] = [$uuid => $connection];
+                } else {
+                    static::$connectionsMap[$path][$uuid] = $connection;
+                }
             }
 
             return $callback($request instanceof Request ? $request->getData() : $request);
@@ -344,9 +353,15 @@ class App extends ServerAbstract
         Context::delete(TcpConnection::class);
 
         // Обновление карты соединений
-        if (isset(static::$connectionsMap[$connection->request->path()][$connection->uuid])) {
-            unset(static::$connectionsMap[$connection->request->path()][$connection->uuid]);
+        $connectionId = spl_object_id($connection);
+        $uuid = static::$connectionUuids[$connectionId] ?? null;
+        if ($uuid && isset($connection->request)) {
+            $path = $connection->request->path();
+            if (isset(static::$connectionsMap[$path][$uuid])) {
+                unset(static::$connectionsMap[$path][$uuid]);
+            }
         }
+        unset(static::$connectionUuids[$connectionId]);
     }
 
     /**
@@ -364,7 +379,14 @@ class App extends ServerAbstract
             // Проходим по всем соединениям сервера
             foreach ($server->connections as $id => $connection) {
                 // Исключаем текущее соединение, если это указано
-                if ($excludeCurrent && $connection->uuid === static::connection()->uuid) continue;
+                if ($excludeCurrent) {
+                    $currentConnection = static::connection();
+                    $currentConnectionId = $currentConnection ? spl_object_id($currentConnection) : null;
+                    $connectionId = spl_object_id($connection);
+                    if ($currentConnectionId && $currentConnectionId === $connectionId) {
+                        continue;
+                    }
+                }
                 // Отправляем данные соединению
                 static::send($connection, $data);
             }
@@ -382,11 +404,17 @@ class App extends ServerAbstract
     public static function sendToGroup(string|Response|null $data = null, bool $excludeCurrent = false): void
     {
         // Получаем путь запроса текущего соединения
-        $path = static::connection()->request->path();
+        $currentConnection = static::connection();
+        $path = $currentConnection ? $currentConnection->request->path() : '';
+        $currentUuid = null;
+        if ($currentConnection && $excludeCurrent) {
+            $currentConnectionId = spl_object_id($currentConnection);
+            $currentUuid = static::$connectionUuids[$currentConnectionId] ?? null;
+        }
         // Проходим по всем соединениям в карте соединений для данного пути
         foreach (static::$connectionsMap[$path] ?? [] as $uuid => $connection) {
             // Исключаем текущее соединение, если это указано
-            if ($excludeCurrent && $uuid === static::connection()->uuid) continue;
+            if ($excludeCurrent && $uuid === $currentUuid) continue;
             // Отправляем данные соединению
             static::send($connection, $data);
         }
