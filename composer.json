@@ -32,6 +32,12 @@
     "triangle/router": "^2.0",
     "triangle/middleware": "^2.0"
   },
+  "require-dev": {
+    "phpunit/phpunit": "^10.5"
+  },
+  "scripts": {
+    "test": "phpunit -c tests/phpunit.xml"
+  },
   "conflict": {
     "triangle/engine-http": "*"
   }

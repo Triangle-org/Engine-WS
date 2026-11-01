@@ -33,7 +33,6 @@ use localzet\Server;
 use localzet\Server\Connection\TcpConnection;
 use localzet\Server\Protocols\Http;
 use localzet\Server\Protocols\Websocket;
-use localzet\ServerAbstract;
 use Monolog\Logger;
 use Psr\Container\ContainerExceptionInterface;
 use Psr\Container\ContainerInterface;
@@ -79,7 +78,7 @@ use function trim;
 /**
  * Class App
  */
-class App extends ServerAbstract
+class App extends \Triangle\Engine\App
 {
     /**
      * @var array
@@ -95,16 +94,21 @@ class App extends ServerAbstract
      * Реакция на HTTP-рукопожатие перед WS-соединением
      * @param TcpConnection $connection
      * @param Http\Request $request
-     * @return void|Http\Response
+     * @return Http\Response|null
      * @throws Throwable
      */
-    public function onWebsocketConnect(TcpConnection &$connection, Http\Request $request): mixed
+    public function onWebsocketConnect(TcpConnection &$connection, Http\Request $request): ?Http\Response
     {
         try {
             // Генерация уникального идентификатора для соединения
             $uuid = generateId();
             static::$connectionUuids[spl_object_id($connection)] = $uuid;
             $path = $request->path();
+
+            // Preserve the handshake request for route and frame handling.
+            $frameRequest = new Request((string)$request);
+            $frameRequest->connection = $connection;
+            $connection->context->triangleRequest = $frameRequest;
 
             // Установка контекста соединения
             Context::set(TcpConnection::class, $connection);
@@ -123,7 +127,7 @@ class App extends ServerAbstract
                     // Маршрут найден
                     $routeInfo[0] = 'route';
                     $callback = $routeInfo[1];
-                    $args = !empty($routeInfo[2]) ? $routeInfo[2] : null;
+                    $args = !empty($routeInfo[2]) ? $routeInfo[2] : [];
                     $route = clone $routeInfo[3];
                     $app = $controller = $action = '';
 
@@ -151,8 +155,11 @@ class App extends ServerAbstract
                     $callback = static::getCallback($plugin, $app, $callback, $args, true, $middlewares);
                     // Собираем обратные вызовы
                     static::collectCallbacks($path, [$callback, $plugin, $app, $controller ?: '', $action, $route]);
-                    // Получаем обратные вызовы
-                    $callback = static::getCallbacks($path, $request);
+                    // Store route metadata for the frame handler without invoking it during handshake.
+                    static::getCallbacks($path, $frameRequest);
+                    if ($response = static::checkHandshake($plugin, $app, $callback, $args ?? [], $route, $request)) {
+                        return $response;
+                    }
                     break;
                 case Dispatcher::NOT_FOUND:
                     // Парсим контроллер и действие из пути
@@ -177,7 +184,7 @@ class App extends ServerAbstract
 
                         // Отправляем обратный вызов
                         static::close_http($connection, $fallback ? $fallback($request) : 404);
-                        return;
+                        return null;
                     }
 
                     $app = $controllerAndAction['app'];
@@ -188,8 +195,11 @@ class App extends ServerAbstract
                     $callback = static::getCallback($plugin, $app, [$controller, $action]);
                     // Собираем обратные вызовы
                     static::collectCallbacks($path, [$callback, $plugin, $app, $controller, $action, null]);
-                    // Получаем обратные вызовы
-                    $callback = static::getCallbacks($path, $request);
+                    // Store route metadata for the frame handler without invoking it during handshake.
+                    static::getCallbacks($path, $frameRequest);
+                    if ($response = static::checkHandshake($plugin, $app, [$controller, $action], [], [], $request)) {
+                        return $response;
+                    }
                     break;
                 case Dispatcher::METHOD_NOT_ALLOWED:
                     // Метод не поддерживается
@@ -207,9 +217,11 @@ class App extends ServerAbstract
                 }
             }
 
-            return $callback($request instanceof Request ? $request->getData() : $request);
+            // Route callbacks process frames after the WebSocket upgrade succeeds.
+            return null;
         } catch (Throwable $e) {
-            static::close_http($connection, static::exceptionResponse($e, $request));
+            $response = static::exceptionResponse($e, $request);
+            static::close_http($connection, $response instanceof Response ? $response : 500);
             return null;
         }
     }
@@ -227,7 +239,11 @@ class App extends ServerAbstract
         // Буферизация запроса
         $buffer = $request;
         /** @var Request $request */
-        $request = $connection->request;
+        $request = $connection->context->triangleRequest ?? null;
+        if (!$request instanceof Request) {
+            static::close($connection, 1011, 'Missing WebSocket request context');
+            return;
+        }
         $request->ws_buffer = $buffer;
 
         try {
@@ -267,14 +283,14 @@ class App extends ServerAbstract
      * @param array|null $middlewares
      * @return callable|Closure Возвращает обратный вызов.
      */
-    public static function getCallback(?string $plugin, string $app, mixed $call, array $args = [], bool $withGlobalMiddleware = true, ?array $middlewares = []): callable|Closure
+    public static function getCallback(?string $plugin, string $app, mixed $call, array $args = [], bool $withGlobalMiddleware = true, ?array $middlewares = [], bool $handshakeOnly = false, ?bool &$handlerInvoked = null): callable|Closure
     {
         $plugin ??= '';
         $isController = is_array($call) && is_string($call[0]);
-        $container = static::container($plugin) ?? static::container();
+        $container = config('container', plugin: $plugin) ?? config('container');
         $middlewares = array_merge(
-            $middlewares,
-            Middleware::getMiddleware($plugin, $app, $isController ? $call[0] : '', $withGlobalMiddleware)
+            Middleware::getMiddleware($plugin, $app, $isController ? $call[0] : '', null, $withGlobalMiddleware),
+            $middlewares
         );
 
         // Создаем экземпляры промежуточного ПО
@@ -291,17 +307,26 @@ class App extends ServerAbstract
             $middlewares[$key][0] = $middleware;
         }
 
+        if ($handshakeOnly) {
+            $callback = static function () use (&$handlerInvoked): Response {
+                $handlerInvoked = true;
+                return new Response(200);
+            };
+
+            return static::wrapMiddleware($middlewares, $callback);
+        }
+
         // Проверяем, нужно ли внедрять зависимости в вызов
         $needInject = static::isNeedInject($call, $args);
         $anonymousArgs = array_values($args);
         if ($isController) {
-            $controllerReuse = static::config($plugin, 'app.controller_reuse', true);
+            $controllerReuse = config('app.controller_reuse', true, $plugin);
             if (!$controllerReuse) {
                 if ($needInject) {
                     $call = function ($request) use ($call, $plugin, $args, $container) {
                         $call[0] = $container->make($call[0]);
                         $reflector = static::getReflector($call);
-                        $args = array_values(static::resolveMethodDependencies($container, $request, array_merge($request->all(), $args), $reflector, static::config($plugin, 'app.debug')));
+                        $args = array_values(static::resolveMethodDependencies($container, $request, array_merge($request->all(), $args), $reflector, config('app.debug', false, $plugin)));
                         return $call(...$args);
                     };
                     $needInject = false;
@@ -332,6 +357,11 @@ class App extends ServerAbstract
             return $response instanceof Response ? $response : new Response(200, [], static::stringify($response));
         };
 
+        return static::wrapMiddleware($middlewares, $callback);
+    }
+
+    protected static function wrapMiddleware(array $middlewares, callable $callback): callable|Closure
+    {
         return $middlewares ? array_reduce($middlewares, function ($carry, $pipe) {
             return function ($request) use ($carry, $pipe) {
                 try {
@@ -341,6 +371,20 @@ class App extends ServerAbstract
                 }
             };
         }, $callback) : $callback;
+    }
+
+    protected static function checkHandshake(?string $plugin, string $app, mixed $call, array $args, RouteObject|null $route, Http\Request $request): ?Http\Response
+    {
+        $handlerInvoked = false;
+        $routeMiddleware = $route ? array_map(static fn ($class): array => [$class, 'process'], $route->getMiddleware()) : [];
+        $callback = static::getCallback($plugin, $app, $call, $args, true, $routeMiddleware, true, $handlerInvoked);
+        $response = $callback($request);
+
+        if (!$handlerInvoked || ($response instanceof Http\Response && $response->getStatusCode() >= 300)) {
+            return $response instanceof Http\Response ? $response : new Http\Response(403);
+        }
+
+        return null;
     }
 
     /**
@@ -355,13 +399,15 @@ class App extends ServerAbstract
         // Обновление карты соединений
         $connectionId = spl_object_id($connection);
         $uuid = static::$connectionUuids[$connectionId] ?? null;
-        if ($uuid && isset($connection->request)) {
-            $path = $connection->request->path();
+        $request = $connection->context->triangleRequest ?? null;
+        if ($uuid && $request instanceof Request) {
+            $path = $request->path();
             if (isset(static::$connectionsMap[$path][$uuid])) {
                 unset(static::$connectionsMap[$path][$uuid]);
             }
         }
         unset(static::$connectionUuids[$connectionId]);
+        unset($connection->context->triangleRequest);
     }
 
     /**
@@ -405,7 +451,8 @@ class App extends ServerAbstract
     {
         // Получаем путь запроса текущего соединения
         $currentConnection = static::connection();
-        $path = $currentConnection ? $currentConnection->request->path() : '';
+        $request = $currentConnection?->context->triangleRequest ?? null;
+        $path = $request instanceof Request ? $request->path() : '';
         $currentUuid = null;
         if ($currentConnection && $excludeCurrent) {
             $currentConnectionId = spl_object_id($currentConnection);
@@ -429,7 +476,10 @@ class App extends ServerAbstract
      */
     protected static function send(TcpConnection $connection, string|Response|null $data = null): void
     {
-        // Отправляем данные соединению
+        if ($data === null) {
+            return;
+        }
+
         $connection->send(is_string($data) ? $data : $data->rawBody());
     }
 
