@@ -40,5 +40,10 @@
   },
   "conflict": {
     "triangle/engine-http": "*"
+  },
+  "config": {
+    "platform": {
+      "php": "8.1.0"
+    }
   }
 }
