@@ -22,13 +22,75 @@
 
 # Triangle Engine WS
 
-Experimental WebSocket application engine for Triangle on Localzet Server. The engine shares the base Engine lifecycle, dispatches routes on the upgrade path, and invokes route callbacks for incoming frames.
+WebSocket adapter for Triangle applications on Localzet Server. It checks routes and route middleware during the HTTP upgrade handshake, then invokes the matching callback for each WebSocket frame.
 
-The current WS application template runs one process. Its broadcast helpers are process-local; the package does not provide inter-process rooms, a durable broker, or horizontal fan-out. HTTP Engine and WS Engine declare a Composer conflict and belong to separate application tracks.
+## Compatibility and installation
+
+Release 2.x targets PHP 8.1+, Localzet Server 7.1+, Triangle Engine 9, Router 2, and Middleware 2. Release 1.x remains on the earlier Engine compatibility line. Engine HTTP and Engine WS conflict in Composer and belong in separate applications.
+
+```bash
+composer require triangle/engine-ws:^2.0
+```
+
+## Minimal application bootstrap
+
+Run this after the Triangle application has loaded its Composer autoloader:
+
+```php
+use localzet\Server;
+use localzet\Server\Protocols\Http;
+use Monolog\Logger;
+use Triangle\Engine\Config;
+use Triangle\Engine\Container;
+use Triangle\Engine\Context;
+use Triangle\Router;
+use Triangle\Ws\App;
+
+Context::init();
+Config::set([
+    'app' => [
+        'plugin_uri' => 'app',
+        'plugin_alias' => 'plugin',
+        'debug' => false,
+        'controller_reuse' => true,
+    ],
+    'container' => new Container(),
+]);
+
+Router::any('/echo', static fn () => 'echo:' . (App::request()?->ws_buffer ?? ''));
+Router::collect([]);
+Http::requestClass(\Triangle\Request::class);
+
+$app = new App(\Triangle\Request::class, new Logger('triangle-ws'));
+$server = new Server('websocket://0.0.0.0:8081');
+$server->count = 1;
+$server->onWebSocketConnect = [$app, 'onWebsocketConnect'];
+$server->onMessage = [$app, 'onMessage'];
+$server->onClose = [$app, 'onClose'];
+
+Server::runAll();
+```
+
+In a Triangle project, keep its existing configuration and container bootstrap instead of replacing them with the example values above.
+
+## Lifecycle and limits
+
+- Route middleware runs before upgrade and may reject the handshake with an HTTP response.
+- `Request::ws_buffer` contains the incoming frame payload. A string callback result is sent as the outgoing frame body.
+- `sendToAll()` and `sendToGroup()` use connections in the current process. They do not provide cross-worker or cross-host fan-out; use a broker or IPC layer for that.
+- Configure authentication, origin checks, rate limits, and message-size limits in the application and Localzet Server.
+- Engine HTTP and Engine WS cannot be installed together because their Composer manifests declare a conflict.
 
 ## Проверка
 
 ```bash
-composer install
-composer test
+composer validate --strict --no-check-publish --no-interaction
+composer run test --no-interaction
+composer audit --abandoned=report
 ```
+
+The suite includes a real loopback handshake and frame exchange on Localzet Server 7. See the [full documentation](https://server.localzet.com/projects/engine-ws/install) for setup, messages, security, and migration from 1.x.
+
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
