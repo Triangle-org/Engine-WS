@@ -495,7 +495,10 @@ class App extends \Triangle\Engine\App
     public static function close(TcpConnection $connection, int $status = 204, mixed $data = null): void
     {
         // Закрываем соединение с отправкой JSON-ответа
-        $connection->close(json(['status' => $status, 'data' => $data ?? Http\Response::PHRASES[$status]]));
+        $connection->close(static::encodeJsonPayload([
+            'status' => $status,
+            'data' => $data ?? Http\Response::PHRASES[$status],
+        ]));
     }
 
     /**
@@ -521,7 +524,18 @@ class App extends \Triangle\Engine\App
             $status = $status->getStatusCode();
         }
         // Закрываем соединение с отправкой HTTP-ответа
-        $connection->close((string)new Http\Response($status, [], json(['status' => $status, 'data' => $data ?? Server\Protocols\Http\Response::PHRASES[$status]])));
+        $connection->close((string)new Http\Response($status, [], static::encodeJsonPayload([
+            'status' => $status,
+            'data' => $data ?? Server\Protocols\Http\Response::PHRASES[$status],
+        ])));
+    }
+
+    private static function encodeJsonPayload(array $payload): string
+    {
+        return \json_encode(
+            $payload,
+            JSON_NUMERIC_CHECK | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR,
+        );
     }
 
 }
