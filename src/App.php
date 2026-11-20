@@ -5,7 +5,7 @@
  * @link        https://github.com/Triangle-org/Websocket
  *
  * @author      Ivan Zorin <creator@localzet.com>
- * @copyright   Copyright (c) 2023-2024 Triangle Framework Team
+ * @copyright   Copyright © 2016-2026 Localzet Group. All rights reserved.
  * @license     https://www.gnu.org/licenses/agpl-3.0 GNU Affero General Public License v3.0
  *
  *              This program is free software: you can redistribute it and/or modify
@@ -223,6 +223,8 @@ class App extends \Triangle\Engine\App
             $response = static::exceptionResponse($e, $request);
             static::close_http($connection, $response instanceof Response ? $response : 500);
             return null;
+        } finally {
+            Context::delete(TcpConnection::class);
         }
     }
 
@@ -238,26 +240,30 @@ class App extends \Triangle\Engine\App
     {
         // Буферизация запроса
         $buffer = $request;
-        /** @var Request $request */
-        $request = $connection->context->triangleRequest ?? null;
-        if (!$request instanceof Request) {
-            static::close($connection, 1011, 'Missing WebSocket request context');
-            return;
-        }
-        $request->ws_buffer = $buffer;
+        $frameRequest = null;
+        Context::set(TcpConnection::class, $connection);
 
         try {
+            /** @var Request|null $request */
+            $request = $connection->context->triangleRequest ?? null;
+            if (!$request instanceof Request) {
+                static::close($connection, 1011, 'Missing WebSocket request context');
+                return;
+            }
+            $frameRequest = $request;
+            $frameRequest->ws_buffer = $buffer;
+
             // Установка контекста запроса
-            Context::set(Request::class, $request);
+            Context::set(Request::class, $frameRequest);
 
             // Получение пути запроса
-            $path = $request->path();
+            $path = $frameRequest->path();
 
             // Проверка наличия callback для данного пути
             if (isset(static::$callbacks[$path])) {
-                $callback = static::getCallbacks($path, $request);
+                $callback = static::getCallbacks($path, $frameRequest);
                 // Отправка ответа с использованием callback
-                static::send($connection, $callback($request));
+                static::send($connection, $callback($frameRequest));
                 return;
             }
 
@@ -265,10 +271,15 @@ class App extends \Triangle\Engine\App
             static::close($connection, 404);
         } catch (Throwable $e) {
             // Отправка ответа с информацией об исключении
-            static::send($connection, static::exceptionResponse($e, $request));
+            if ($frameRequest instanceof Request) {
+                static::send($connection, static::exceptionResponse($e, $frameRequest));
+            } else {
+                static::close($connection, 1011, 'Invalid WebSocket request context');
+            }
         } finally {
             // Удаление контекста запроса
             Context::delete(Request::class);
+            Context::delete(TcpConnection::class);
         }
     }
 
@@ -354,7 +365,7 @@ class App extends \Triangle\Engine\App
                 return static::exceptionResponse($e, $request);
             }
 
-            return $response instanceof Response ? $response : new Response(200, [], static::stringify($response));
+            return static::normalizeResponse($response);
         };
 
         return static::wrapMiddleware($middlewares, $callback);
@@ -371,6 +382,29 @@ class App extends \Triangle\Engine\App
                 }
             };
         }, $callback) : $callback;
+    }
+
+    protected static function normalizeResponse(mixed $response): Response
+    {
+        if ($response instanceof Response) {
+            return $response;
+        }
+
+        if ($response instanceof Http\Response) {
+            $normalized = new Response(
+                $response->getStatusCode(),
+                $response->getHeaders(),
+                $response->rawBody() ?? '',
+            );
+
+            if ($response instanceof \Triangle\Engine\Response && ($exception = $response->exception())) {
+                $normalized->exception($exception);
+            }
+
+            return $normalized;
+        }
+
+        return new Response(200, [], static::stringify($response));
     }
 
     protected static function checkHandshake(?string $plugin, string $app, mixed $call, array $args, RouteObject|null $route, Http\Request $request): ?Http\Response
@@ -393,32 +427,36 @@ class App extends \Triangle\Engine\App
      */
     public function onClose(mixed &$connection): void
     {
-        // Удаление контекста соединения
-        Context::delete(TcpConnection::class);
+        Context::set(TcpConnection::class, $connection);
 
-        // Обновление карты соединений
-        $connectionId = spl_object_id($connection);
-        $uuid = static::$connectionUuids[$connectionId] ?? null;
-        $request = $connection->context->triangleRequest ?? null;
-        if ($uuid && $request instanceof Request) {
-            $path = $request->path();
-            if (isset(static::$connectionsMap[$path][$uuid])) {
-                unset(static::$connectionsMap[$path][$uuid]);
+        try {
+            // Обновление карты соединений
+            $connectionId = spl_object_id($connection);
+            $uuid = static::$connectionUuids[$connectionId] ?? null;
+            $request = $connection->context->triangleRequest ?? null;
+            if ($uuid && $request instanceof Request) {
+                $path = $request->path();
+                if (isset(static::$connectionsMap[$path][$uuid])) {
+                    unset(static::$connectionsMap[$path][$uuid]);
+                }
             }
+            unset(static::$connectionUuids[$connectionId]);
+            unset($connection->context->triangleRequest);
+        } finally {
+            Context::delete(Request::class);
+            Context::delete(TcpConnection::class);
         }
-        unset(static::$connectionUuids[$connectionId]);
-        unset($connection->context->triangleRequest);
     }
 
     /**
      * Отправка данных всем соединениям.
      *
-     * @param string|Response|null $data Данные для отправки.
+     * @param string|Http\Response|null $data Данные для отправки.
      * @param bool $excludeCurrent Исключить текущее соединение.
      * @return void
      * @throws Throwable
      */
-    public static function sendToAll(string|Response|null $data = null, bool $excludeCurrent = false): void
+    public static function sendToAll(string|Http\Response|null $data = null, bool $excludeCurrent = false): void
     {
         // Проходим по всем серверам
         foreach (static::$server::getAllServers() as $server) {
@@ -442,12 +480,12 @@ class App extends \Triangle\Engine\App
     /**
      * Отправка данных группе соединений.
      *
-     * @param string|Response|null $data Данные для отправки.
+     * @param string|Http\Response|null $data Данные для отправки.
      * @param bool $excludeCurrent Исключить текущее соединение.
      * @return void
      * @throws Throwable
      */
-    public static function sendToGroup(string|Response|null $data = null, bool $excludeCurrent = false): void
+    public static function sendToGroup(string|Http\Response|null $data = null, bool $excludeCurrent = false): void
     {
         // Получаем путь запроса текущего соединения
         $currentConnection = static::connection();
@@ -471,16 +509,16 @@ class App extends \Triangle\Engine\App
      * Отправка данных конкретному соединению.
      *
      * @param TcpConnection|mixed $connection Соединение TCP.
-     * @param string|Response|null $data Данные для отправки.
+     * @param string|Http\Response|null $data Данные для отправки.
      * @throws Throwable
      */
-    protected static function send(TcpConnection $connection, string|Response|null $data = null): void
+    protected static function send(TcpConnection $connection, string|Http\Response|null $data = null): void
     {
         if ($data === null) {
             return;
         }
 
-        $connection->send(is_string($data) ? $data : $data->rawBody());
+        $connection->send(is_string($data) ? $data : ($data->rawBody() ?? ''));
     }
 
     /**
@@ -505,17 +543,17 @@ class App extends \Triangle\Engine\App
      * Закрытие HTTP-соединения с отправкой статуса и данных.
      *
      * @param TcpConnection $connection Соединение TCP.
-     * @param int|Response $status Статус закрытия или объект ответа.
+     * @param int|Http\Response $status Статус закрытия или объект ответа.
      * @param mixed|null $data Данные для отправки.
      * @return void
      * @throws Throwable
      */
-    public static function close_http(TcpConnection $connection, int|Response $status = 204, mixed $data = null): void
+    public static function close_http(TcpConnection $connection, int|Http\Response $status = 204, mixed $data = null): void
     {
         // Если статус является объектом ответа
-        if ($status instanceof Response) {
+        if ($status instanceof Http\Response) {
             // Получаем сообщение об ошибке, если есть
-            if ($e = $status->exception()) {
+            if ($status instanceof Response && ($e = $status->exception())) {
                 $data = $e->getMessage();
             } else {
                 $data = $status->rawBody();

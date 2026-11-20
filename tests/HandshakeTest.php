@@ -1,5 +1,26 @@
 <?php
 
+/**
+ * @package Triangle WebSocket Component
+ * @link https://github.com/Triangle-org/Engine-WS
+ * @author Ivan Zorin <creator@localzet.com>
+ * @copyright Copyright © 2016-2026 Localzet Group. All rights reserved.
+ * @license https://www.gnu.org/licenses/agpl-3.0 GNU Affero General Public License v3.0
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 declare(strict_types=1);
 
 use localzet\Server\Connection\TcpConnection;
@@ -19,12 +40,18 @@ use Triangle\Request as WsRequest;
 final class HandshakeProbeApp extends App
 {
     public static bool $frameHandlerCalled = false;
+    public static array $frameConnectionAtStart = [];
+    public static array $frameConnectionAfterResume = [];
 
     public static function resetCallbacks(): void
     {
-        $property = new ReflectionProperty(App::class, 'callbacks');
-        $property->setAccessible(true);
-        $property->setValue(null, []);
+        foreach (['callbacks', 'connectionsMap', 'connectionUuids'] as $propertyName) {
+            $property = new ReflectionProperty(App::class, $propertyName);
+            $property->setValue(null, []);
+        }
+
+        self::$frameConnectionAtStart = [];
+        self::$frameConnectionAfterResume = [];
     }
 
     public function onMessage(mixed &$connection, mixed $request): void
@@ -37,6 +64,7 @@ final class HandshakeProbeConnection extends TcpConnection
 {
     public function __construct()
     {
+        $this->id = 1;
         $this->context = new stdClass();
     }
 
@@ -72,11 +100,9 @@ final class HandshakeTest extends TestCase
     {
         $router = new ReflectionClass(Router::class);
         $generatorProperty = $router->getProperty('dataGenerator');
-        $generatorProperty->setAccessible(true);
         $generatorProperty->setValue(null, new \Triangle\Router\DataGenerator\GroupCountBased());
         require_once __DIR__ . '/fixtures/config/route.php';
         $property = $router->getProperty('instance');
-        $property->setAccessible(true);
         $property->getValue()?->getData();
         $instance = $property->getValue();
         $instance = $instance ?? Router::instance();
@@ -89,7 +115,6 @@ final class HandshakeTest extends TestCase
         }
         $dispatcher = new \Triangle\Router\Dispatcher\GroupCountBased($routes);
         $dispatcherProperty = new ReflectionProperty($instance, 'dispatcher');
-        $dispatcherProperty->setAccessible(true);
         $dispatcherProperty->setValue($instance, $dispatcher);
     }
 
@@ -108,6 +133,7 @@ final class HandshakeTest extends TestCase
         self::assertInstanceOf(\Triangle\Response::class, $response);
         self::assertSame(401, $response->getStatusCode());
         self::assertFalse(HandshakeProbeApp::$frameHandlerCalled);
+        self::assertFalse(Context::has(TcpConnection::class));
     }
 
     public function testAuthorizedHandshakeRunsMiddlewareButDefersRouteHandler(): void
@@ -132,6 +158,7 @@ final class HandshakeTest extends TestCase
         }
         self::assertInstanceOf(WsRequest::class, $connection->context->triangleRequest);
         self::assertFalse(HandshakeProbeApp::$frameHandlerCalled);
+        self::assertFalse(Context::has(TcpConnection::class));
     }
 
     public function testFirstFrameUsesSavedHandshakeRequest(): void
@@ -147,6 +174,56 @@ final class HandshakeTest extends TestCase
         $app->onMessage($connection, $buffer);
 
         self::assertTrue(HandshakeProbeApp::$frameHandlerCalled);
+        self::assertFalse(Context::has(TcpConnection::class));
+    }
+
+    public function testMissingFrameRequestStillClearsConnectionContext(): void
+    {
+        $this->configureApp();
+        $app = $this->createApp();
+        $connection = new HandshakeProbeConnection();
+        $buffer = 'unexpected';
+
+        $app->onMessage($connection, $buffer);
+
+        self::assertFalse(Context::has(TcpConnection::class));
+    }
+
+    public function testFiberCallbacksKeepTheirOwnConnectionContext(): void
+    {
+        $this->configureApp();
+        $app = $this->createApp();
+        $connectionA = new HandshakeProbeConnection();
+        $connectionB = new HandshakeProbeConnection();
+        self::assertNull($app->onWebsocketConnect($connectionA, $this->request('/echo')));
+        self::assertNull($app->onWebsocketConnect($connectionB, $this->request('/echo')));
+
+        $bufferA = 'first';
+        $bufferB = 'second';
+        $fiberA = new Fiber(static function () use ($app, &$connectionA, &$bufferA): void {
+            $app->onMessage($connectionA, $bufferA);
+        });
+        $fiberB = new Fiber(static function () use ($app, &$connectionB, &$bufferB): void {
+            $app->onMessage($connectionB, $bufferB);
+        });
+
+        if (class_exists(\localzet\Server\Events\Linux::class)) {
+            \localzet\Server::$eventLoopClass = \localzet\Server\Events\Linux::class;
+        }
+
+        $fiberA->start();
+        self::assertTrue($fiberA->isSuspended(), 'The first frame callback did not suspend.');
+        $fiberB->start();
+        self::assertTrue($fiberB->isSuspended(), 'The second frame callback did not suspend.');
+        $fiberA->resume();
+        $fiberB->resume();
+        \localzet\Server::$eventLoopClass = null;
+
+        self::assertSame($connectionA, HandshakeProbeApp::$frameConnectionAtStart[spl_object_id($connectionA)]);
+        self::assertSame($connectionB, HandshakeProbeApp::$frameConnectionAtStart[spl_object_id($connectionB)]);
+        self::assertSame($connectionA, HandshakeProbeApp::$frameConnectionAfterResume[spl_object_id($connectionA)]);
+        self::assertSame($connectionB, HandshakeProbeApp::$frameConnectionAfterResume[spl_object_id($connectionB)]);
+        self::assertFalse(Context::has(TcpConnection::class));
     }
 
     private function configureApp(): void
@@ -168,7 +245,7 @@ final class HandshakeTest extends TestCase
 
     private function createApp(): HandshakeProbeApp
     {
-        return new HandshakeProbeApp(\Triangle\Ws\Request::class, new Logger('test', [new NullHandler()]));
+        return new HandshakeProbeApp(WsRequest::class, new Logger('test', [new NullHandler()]));
     }
 
     private function request(string $path): Http\Request

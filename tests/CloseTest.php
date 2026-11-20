@@ -5,7 +5,7 @@
  * @link        https://github.com/Triangle-org/Engine-WS
  *
  * @author      Ivan Zorin <creator@localzet.com>
- * @copyright   Copyright (c) 2023-2024 Triangle Framework Team
+ * @copyright   Copyright © 2016-2026 Localzet Group. All rights reserved.
  * @license     https://www.gnu.org/licenses/agpl-3.0 GNU Affero General Public License v3.0
  *
  *              This program is free software: you can redistribute it and/or modify
@@ -32,6 +32,7 @@ final class CloseProbeConnection extends TcpConnection
 
     public function __construct()
     {
+        $this->id = 1;
         $this->context = new stdClass();
     }
 
