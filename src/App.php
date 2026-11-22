@@ -550,19 +550,22 @@ class App extends \Triangle\Engine\App
      */
     public static function close_http(TcpConnection $connection, int|Http\Response $status = 204, mixed $data = null): void
     {
-        // Если статус является объектом ответа
+        $headers = [];
         if ($status instanceof Http\Response) {
-            // Получаем сообщение об ошибке, если есть
+            $headers = $status->getHeaders();
+            foreach ($headers as $name => $_) {
+                if (in_array(strtolower((string)$name), ['content-length', 'transfer-encoding'], true)) {
+                    unset($headers[$name]);
+                }
+            }
             if ($status instanceof Response && ($e = $status->exception())) {
                 $data = $e->getMessage();
             } else {
                 $data = $status->rawBody();
             }
-            // Получаем статусный код из объекта ответа
             $status = $status->getStatusCode();
         }
-        // Закрываем соединение с отправкой HTTP-ответа
-        $connection->close((string)new Http\Response($status, [], static::encodeJsonPayload([
+        $connection->close((string)new Http\Response($status, $headers, static::encodeJsonPayload([
             'status' => $status,
             'data' => $data ?? Server\Protocols\Http\Response::PHRASES[$status],
         ])));

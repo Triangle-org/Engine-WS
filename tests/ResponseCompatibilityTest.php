@@ -96,11 +96,22 @@ final class ResponseCompatibilityTest extends TestCase
     public function testServerResponseCanBeUsedForHttpHandshakeRejection(): void
     {
         $connection = new ResponseCompatibilityConnection();
-        $response = new ServerResponse(403, ['X-Adapter' => 'preserved'], 'access denied');
+        $response = new ServerResponse(401, [
+            'WWW-Authenticate' => 'Basic realm="websocket"',
+            'X-Adapter' => 'preserved',
+            'Content-Length' => '3',
+            'Transfer-Encoding' => 'chunked',
+        ], 'access denied');
 
         ResponseCompatibilityProbeApp::closeHttpForTest($connection, $response);
 
-        self::assertStringStartsWith('HTTP/1.1 403', $connection->closedData);
-        self::assertStringContainsString('"data": "access denied"', $connection->closedData);
+        self::assertIsString($connection->closedData);
+        [$headers, $body] = explode("\r\n\r\n", $connection->closedData, 2);
+        self::assertStringStartsWith('HTTP/1.1 401', $headers);
+        self::assertStringContainsString('WWW-Authenticate: Basic realm="websocket"', $headers);
+        self::assertStringContainsString('X-Adapter: preserved', $headers);
+        self::assertStringNotContainsString('Transfer-Encoding:', $headers);
+        self::assertMatchesRegularExpression('/\r\nContent-Length: ' . strlen($body) . '(?:\r\n|$)/', $headers);
+        self::assertStringContainsString('"data": "access denied"', $body);
     }
 }

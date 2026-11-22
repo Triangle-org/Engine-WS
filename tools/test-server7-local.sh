@@ -17,7 +17,7 @@ COMPOSER="$manifest" composer config minimum-stability dev
 COMPOSER="$manifest" composer config prefer-stable true
 
 COMPOSER="$manifest" composer config repositories.server7-server \
-    '{"type":"path","url":"../../localzet/Server","options":{"symlink":true,"versions":{"localzet/server":"7.1.0"}}}'
+    '{"type":"path","url":"../../localzet/Server","options":{"symlink":true,"versions":{"localzet/server":"7.2.2"}}}'
 COMPOSER="$manifest" composer config repositories.server7-engine \
     '{"type":"path","url":"../Engine","options":{"symlink":true,"versions":{"triangle/engine":"9.0.x-dev"}}}'
 COMPOSER="$manifest" composer config repositories.server7-router \
